@@ -277,7 +277,15 @@ async function conectarWhatsApp() {
 
   whatsappSock.ev.on('creds.update', saveCreds)
 
-  whatsappSock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+  whatsappSock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      const url = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`
+      console.log('\n==================================================')
+      console.log('  ESCANEA EL QR CON TU WHATSAPP')
+      console.log('  Abre este enlace en tu navegador:')
+      console.log('  ' + url)
+      console.log('==================================================\n')
+    }
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode
       if (code !== DisconnectReason.loggedOut) {
