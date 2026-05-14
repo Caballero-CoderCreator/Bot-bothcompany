@@ -154,7 +154,7 @@ io.on('connection', (socket) => {
 })
 
 // ── Procesar mensaje entrante ──
-async function procesarMensaje(message, esNuevo = true) {
+async function procesarMensaje(message, enTiempoReal = true) {
   const jid = message.key.remoteJid
   if (!jid || jid.includes('broadcast') || jid.endsWith('@g.us')) return
 
@@ -166,7 +166,7 @@ async function procesarMensaje(message, esNuevo = true) {
 
   // Mensaje enviado desde el teléfono (respuesta manual)
   if (message.key.fromMe) {
-    if (!esNuevo) return  // ignorar historial de mensajes propios al reconectar
+    if (!enTiempoReal) return  // ignorar historial de mensajes propios al reconectar
     if (botRespondiendo.has(jid) || !texto.trim()) return
     if (!tomadoPorHumano[jid]) {
       tomadoPorHumano[jid] = true
