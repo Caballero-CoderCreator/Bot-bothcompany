@@ -175,8 +175,13 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
   // Mensaje enviado desde el teléfono (respuesta manual)
   if (message.key.fromMe) {
-    if (!enTiempoReal) return  // ignorar historial de mensajes propios al reconectar
-    if (botRespondiendo.has(jid) || !texto.trim()) return
+    if (!enTiempoReal) return  // ignorar historial al reconectar
+    if (!texto.trim()) return
+    // Ignorar el eco que WhatsApp devuelve de los mensajes enviados por el bot
+    if (botRespondiendo.has(jid)) return
+    const msgsJid = conversaciones[jid] || []
+    const ultimoBot = [...msgsJid].reverse().find(m => m.de === 'bot')
+    if (ultimoBot && ultimoBot.texto === texto) return  // es el eco del bot, no una respuesta humana
     if (!tomadoPorHumano[jid]) {
       tomadoPorHumano[jid] = true
       io.emit('estado_actualizado', { numero: jid, tomado: true })
