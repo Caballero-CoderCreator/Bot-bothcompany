@@ -1,5 +1,6 @@
 require('dotenv').config()
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
+const { useSupabaseAuthState } = require('./lib/supabase-auth-state')
 const { Boom } = require('@hapi/boom')
 const pino = require('pino')
 const Anthropic = require('@anthropic-ai/sdk')
@@ -15,6 +16,7 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
 
 const PORT = process.env.PORT || 3000
+const CRM_URL = process.env.CRM_URL || 'https://crmbothcompany.netlify.app'
 
 // ── Estado en memoria ──
 const conversaciones = {}
@@ -78,20 +80,25 @@ async function guardarCliente(telefono, nombre, empresaNombre) {
       .maybeSingle()
 
     if (!existente) {
-      await supabase.from('clientes').insert({
+      const { data: nuevo } = await supabase.from('clientes').insert({
         nombre: nombre || telefono,
         telefono,
         fuente: 'whatsapp'
-      })
+      }).select('id').maybeSingle()
       console.log(`Nuevo cliente en CRM: ${nombre || telefono}`)
-    } else if (empresaNombre && !existente.empresa) {
-      await supabase.from('clientes')
-        .update({ nombre: nombre || existente.nombre, empresa: empresaNombre })
-        .eq('telefono', telefono)
-      console.log(`Cliente actualizado: ${nombre} — ${empresaNombre}`)
+      return nuevo?.id || null
+    } else {
+      if (empresaNombre && !existente.empresa) {
+        await supabase.from('clientes')
+          .update({ nombre: nombre || existente.nombre, empresa: empresaNombre })
+          .eq('telefono', telefono)
+        console.log(`Cliente actualizado: ${nombre} — ${empresaNombre}`)
+      }
+      return existente.id
     }
   } catch (e) {
     console.error('Error Supabase:', e.message)
+    return null
   }
 }
 
@@ -174,12 +181,14 @@ async function procesarMensaje(message) {
   const pushName = message.pushName || telefono
   const esNuevo = !conversaciones[jid]
 
-  if (esNuevo) await guardarCliente(telefono, pushName, null)
+  let clienteId = contactosInfo[jid]?.clienteId || null
+  if (esNuevo) clienteId = await guardarCliente(telefono, pushName, null)
 
   contactosInfo[jid] = {
     display: telefono,
     nombre: contactosInfo[jid]?.nombre || pushName,
-    empresa: contactosInfo[jid]?.empresa || ''
+    empresa: contactosInfo[jid]?.empresa || '',
+    clienteId: clienteId || contactosInfo[jid]?.clienteId || null
   }
 
   if (!conversaciones[jid]) conversaciones[jid] = []
@@ -264,7 +273,7 @@ async function procesarMensaje(message) {
 
 // ── Conectar WhatsApp ──
 async function conectarWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('./session')
+  const { state, saveCreds } = await useSupabaseAuthState(supabase)
   const { version } = await fetchLatestBaileysVersion()
 
   whatsappSock = makeWASocket({
@@ -280,6 +289,7 @@ async function conectarWhatsApp() {
   whatsappSock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       const url = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`
+      io.emit('qr_disponible', url)
       console.log('\n==================================================')
       console.log('  ESCANEA EL QR CON TU WHATSAPP')
       console.log('  Abre este enlace en tu navegador:')
