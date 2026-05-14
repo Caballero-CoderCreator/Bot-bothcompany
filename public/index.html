@@ -285,7 +285,7 @@
     convList.innerHTML = ''
     jids.forEach(function(jid) {
       const info = contactosInfo[jid] || {}
-      const nombre = info.nombre || formatJid(jid)
+      const nombre = info.nombre || info.display || formatJid(jid)
       const empresa = info.empresa || ''
       const preview = ultimoMensaje(jid)
       const tomado = tomadoPorHumano[jid]
@@ -351,11 +351,11 @@
     renderConvList()
 
     const info = contactosInfo[jid] || {}
-    const nombre = info.nombre || formatJid(jid)
+    const nombre = info.nombre || info.display || formatJid(jid)
 
     clientName.textContent = nombre
     clientEmpresa.textContent = info.empresa || ''
-    clientTel.textContent = formatJid(jid)
+    clientTel.textContent = info.telefono || info.display || formatJid(jid)
     clientAvatar.textContent = inicialLetra(nombre)
 
     if (info.clienteId) {
@@ -421,7 +421,7 @@
     contactosInfo[numero] = Object.assign({}, contactosInfo[numero], info)
     renderConvList()
     if (numero === jidActivo) {
-      clientName.textContent = info.nombre || formatJid(numero)
+      clientName.textContent = info.nombre || info.display || formatJid(numero)
       clientEmpresa.textContent = info.empresa || ''
       clientAvatar.textContent = inicialLetra(info.nombre)
     }

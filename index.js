@@ -27,6 +27,7 @@ const botRespondiendo = new Set()
 let botListo = false
 let whatsappSock = null
 let ultimoQR = null
+const lidToPhone = {}  // mapeo LID → teléfono real (poblado por contacts.upsert)
 
 // ── Express + Socket.io ──
 const app = express()
@@ -70,6 +71,14 @@ INSTRUCCIONES:
 Al final de CADA respuesta agregá exactamente una de estas etiquetas:
 - Si el cliente consulta información general → [ESTADO:CONSULTA]
 - Si quiere cotización específica, tiene diseño listo, quiere hacer pedido o hablar con alguien → [ESTADO:LISTO_PARA_VENTA]`
+
+// ── Resolver teléfono real desde JID ──
+function resolverTelefono(jid) {
+  if (jid.endsWith('@lid')) {
+    return lidToPhone[jid] || null  // null si aún no sincronizado
+  }
+  return jid.replace('@s.whatsapp.net', '')
+}
 
 // ── Supabase ──
 async function guardarCliente(telefono, nombre, empresaNombre) {
@@ -180,15 +189,20 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
   if (!texto.trim()) return
 
-  const telefono = jid.replace('@s.whatsapp.net', '')
-  const pushName = message.pushName || telefono
+  const telefonoReal = resolverTelefono(jid)
+  const pushName = message.pushName || telefonoReal || jid
   const esNuevo = !conversaciones[jid]
 
   let clienteId = contactosInfo[jid]?.clienteId || null
-  if (esNuevo) clienteId = await guardarCliente(telefono, pushName, null)
+  if (esNuevo) {
+    // Usar teléfono real si disponible, si no usar el LID como identificador único
+    const telefonoGuardar = telefonoReal || jid.replace('@lid', '').replace('@s.whatsapp.net', '')
+    clienteId = await guardarCliente(telefonoGuardar, pushName, null)
+  }
 
   contactosInfo[jid] = {
-    display: telefono,
+    telefono: telefonoReal,
+    display: telefonoReal || pushName,
     nombre: contactosInfo[jid]?.nombre || pushName,
     empresa: contactosInfo[jid]?.empresa || '',
     clienteId: clienteId || contactosInfo[jid]?.clienteId || null
@@ -288,6 +302,22 @@ async function conectarWhatsApp() {
   })
 
   whatsappSock.ev.on('creds.update', saveCreds)
+
+  // Poblar mapa LID → teléfono real cuando WhatsApp sincroniza contactos
+  whatsappSock.ev.on('contacts.upsert', (contacts) => {
+    for (const contact of contacts) {
+      if (contact.lid && contact.id && contact.id.endsWith('@s.whatsapp.net')) {
+        const phone = contact.id.replace('@s.whatsapp.net', '')
+        lidToPhone[contact.lid] = phone
+        // Si ya tenemos info de este contacto con LID, actualizarla
+        if (contactosInfo[contact.lid]) {
+          contactosInfo[contact.lid].telefono = phone
+          contactosInfo[contact.lid].display = phone
+          io.emit('contacto_actualizado', { numero: contact.lid, info: contactosInfo[contact.lid] })
+        }
+      }
+    }
+  })
 
   whatsappSock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
