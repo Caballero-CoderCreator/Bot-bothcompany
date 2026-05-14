@@ -217,6 +217,9 @@ async function procesarMensaje(message, enTiempoReal = true) {
   conversaciones[jid].push({ de: 'cliente', texto, hora })
   io.emit('nuevo_mensaje', { numero: jid, mensaje: { de: 'cliente', texto, hora }, info: contactosInfo[jid] })
 
+  // Mensajes históricos (append al reconectar): solo mostrar en panel, nunca responder
+  if (!enTiempoReal) return
+
   if (tomadoPorHumano[jid]) {
     io.emit('atencion_requerida', jid)
     return
@@ -298,9 +301,6 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
   } catch (error) {
     console.error('Error IA:', error.message)
-    await whatsappSock.sendMessage(jid, {
-      text: '¡Hola! Gracias por escribirnos a Both Company. Un asesor te contactará pronto.'
-    })
   }
 }
 
