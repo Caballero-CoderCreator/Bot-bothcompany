@@ -26,6 +26,7 @@ const esperandoNombre = new Set()
 const botRespondiendo = new Set()
 let botListo = false
 let whatsappSock = null
+let ultimoQR = null
 
 // ── Express + Socket.io ──
 const app = express()
@@ -124,6 +125,7 @@ async function extraerNombreEmpresa(texto) {
 io.on('connection', (socket) => {
   socket.emit('conversaciones_iniciales', { conversaciones, tomadoPorHumano, contactosInfo })
   if (botListo) socket.emit('bot_conectado')
+  else if (ultimoQR) socket.emit('qr_disponible', ultimoQR)
 
   socket.on('tomar_control', (fromId) => {
     tomadoPorHumano[fromId] = true
@@ -289,6 +291,7 @@ async function conectarWhatsApp() {
   whatsappSock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       const url = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=300x300`
+      ultimoQR = url
       io.emit('qr_disponible', url)
       console.log('\n==================================================')
       console.log('  ESCANEA EL QR CON TU WHATSAPP')
@@ -311,6 +314,7 @@ async function conectarWhatsApp() {
       console.log('  BOT DE BOTH COMPANY ACTIVO')
       console.log('==============================\n')
       botListo = true
+      ultimoQR = null
       io.emit('bot_conectado')
     }
   })
