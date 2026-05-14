@@ -225,13 +225,24 @@ async function procesarMensaje(message, enTiempoReal = true) {
   // Si estamos esperando nombre/empresa
   if (esperandoNombre.has(jid)) {
     esperandoNombre.delete(jid)
-    const extraido = await extraerNombreEmpresa(texto)
-    if (extraido && (extraido.nombre || extraido.empresa)) {
-      const nombre = extraido.nombre || pushName
-      const emp = extraido.empresa || ''
-      await guardarCliente(telefono, nombre, emp)
-      contactosInfo[jid] = { display: telefono, nombre, empresa: emp }
-      io.emit('contacto_actualizado', { numero: jid, info: contactosInfo[jid] })
+    try {
+      const extraido = await extraerNombreEmpresa(texto)
+      if (extraido && (extraido.nombre || extraido.empresa)) {
+        const nombre = extraido.nombre || pushName
+        const emp = extraido.empresa || ''
+        const telefonoGuardar = telefonoReal || jid.replace('@lid', '').replace('@s.whatsapp.net', '')
+        await guardarCliente(telefonoGuardar, nombre, emp)
+        contactosInfo[jid] = {
+          ...contactosInfo[jid],
+          telefono: telefonoReal,
+          display: telefonoReal || nombre,
+          nombre,
+          empresa: emp
+        }
+        io.emit('contacto_actualizado', { numero: jid, info: contactosInfo[jid] })
+      }
+    } catch (e) {
+      console.error('Error extrayendo nombre/empresa:', e.message)
     }
   }
 
@@ -359,7 +370,11 @@ async function conectarWhatsApp() {
     if (type !== 'notify' && type !== 'append') return
     for (const message of messages) {
       if (!message.message) continue
-      await procesarMensaje(message, type === 'notify')
+      try {
+        await procesarMensaje(message, type === 'notify')
+      } catch (e) {
+        console.error('Error procesando mensaje:', e.message)
+      }
     }
   })
 }
