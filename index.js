@@ -154,7 +154,7 @@ io.on('connection', (socket) => {
 })
 
 // ── Procesar mensaje entrante ──
-async function procesarMensaje(message) {
+async function procesarMensaje(message, esNuevo = true) {
   const jid = message.key.remoteJid
   if (!jid || jid.includes('broadcast') || jid.endsWith('@g.us')) return
 
@@ -166,6 +166,7 @@ async function procesarMensaje(message) {
 
   // Mensaje enviado desde el teléfono (respuesta manual)
   if (message.key.fromMe) {
+    if (!esNuevo) return  // ignorar historial de mensajes propios al reconectar
     if (botRespondiendo.has(jid) || !texto.trim()) return
     if (!tomadoPorHumano[jid]) {
       tomadoPorHumano[jid] = true
@@ -323,7 +324,7 @@ async function conectarWhatsApp() {
     if (type !== 'notify' && type !== 'append') return
     for (const message of messages) {
       if (!message.message) continue
-      await procesarMensaje(message)
+      await procesarMensaje(message, type === 'notify')
     }
   })
 }
