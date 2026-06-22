@@ -15,6 +15,12 @@ const empresa = require('./config-empresa')
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
 
+// ── Modelos ──
+// Haiku para saludos/FAQ/clasificación (rápido y barato).
+// Sonnet solo para cotizaciones: sumar bordados/tamaños/cantidades con la tabla de precios.
+const MODELO_RAPIDO = 'claude-haiku-4-5-20251001'
+const MODELO_COTIZA = 'claude-sonnet-4-6'
+
 const PORT = process.env.PORT || 3000
 const CRM_URL = process.env.CRM_URL || 'https://crmbothcompany.netlify.app'
 
@@ -28,6 +34,8 @@ let botListo = false
 let whatsappSock = null
 let ultimoQR = null
 const lidToPhone = {}  // mapeo LID → teléfono real (poblado por contacts.upsert)
+const colasPorJid = {}  // cola de procesamiento por JID para evitar respuestas paralelas
+let reconectando = false
 
 // ── Express + Socket.io ──
 const app = express()
@@ -116,7 +124,7 @@ async function guardarCliente(telefono, nombre, empresaNombre) {
 async function extraerNombreEmpresa(texto) {
   try {
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+      model: MODELO_RAPIDO,
       max_tokens: 100,
       messages: [{
         role: 'user',
@@ -127,6 +135,23 @@ async function extraerNombreEmpresa(texto) {
     return match ? JSON.parse(match[0]) : null
   } catch (e) {
     return null
+  }
+}
+
+// ── Clasifica si el cliente está pidiendo/armando una cotización (→ Sonnet) ──
+async function necesitaCotizacion(contexto, textoActual) {
+  try {
+    const res = await anthropic.messages.create({
+      model: MODELO_RAPIDO,
+      max_tokens: 5,
+      system: `Clasificás el último mensaje de un cliente de una empresa de bordados y uniformes. Respondé SOLO con una palabra, sin nada más:
+COTIZA = pide un precio/cotización o está dando los datos para una (cantidad, prenda, tipo o tamaño de bordado, "cuánto sale", "precio por X unidades", confirma cantidades o medidas).
+GENERAL = saludos, preguntas informativas sin números, dudas sobre el servicio, o charla.`,
+      messages: [{ role: 'user', content: `Conversación reciente:\n${contexto}\n\nÚltimo mensaje a clasificar: "${textoActual}"` }]
+    })
+    return res.content[0].text.toUpperCase().includes('COTIZA')
+  } catch (e) {
+    return false  // ante error, usar el modelo rápido por defecto
   }
 }
 
@@ -167,9 +192,13 @@ async function procesarMensaje(message, enTiempoReal = true) {
   const jid = message.key.remoteJid
   if (!jid || jid.includes('broadcast') || jid.endsWith('@g.us')) return
 
-  const texto = message.message?.conversation
+  const textoRaw = message.message?.conversation
     || message.message?.extendedTextMessage?.text
+    || message.message?.imageMessage?.caption
     || ''
+
+  const esImagen = !!(message.message?.imageMessage || message.message?.stickerMessage || message.message?.documentMessage)
+  const texto = textoRaw || (esImagen ? '[El cliente envió una imagen — probablemente su logo o diseño. Indicale que la recibiste y que un asesor la revisará]' : '')
 
   const hora = new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
 
@@ -256,12 +285,21 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
     const historial = (conversaciones[jid] || [])
       .filter(m => m.de === 'cliente' || m.de === 'bot')
-      .slice(-10)
+      .slice(-14)
       .map(m => ({ role: m.de === 'cliente' ? 'user' : 'assistant', content: m.texto }))
 
+    await whatsappSock.sendPresenceUpdate('composing', jid)
+
+    // Enrutado: si el cliente pide/arma una cotización → Sonnet (más preciso con números); si no → Haiku
+    const contextoClasif = historial.slice(-4)
+      .map(m => `${m.role === 'user' ? 'Cliente' : 'Bot'}: ${m.content}`).join('\n')
+    const cotizando = await necesitaCotizacion(contextoClasif, texto)
+    const modeloRespuesta = cotizando ? MODELO_COTIZA : MODELO_RAPIDO
+    if (cotizando) console.log('→ Intencion de cotizar detectada: respondiendo con Sonnet')
+
     const respuesta = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 450,
+      model: modeloRespuesta,
+      max_tokens: 600,
       system: promptFinal,
       messages: historial
     })
@@ -273,6 +311,7 @@ async function procesarMensaje(message, enTiempoReal = true) {
       .replace(/\[ESTADO:LISTO_PARA_VENTA\]/g, '')
       .trim()
 
+    await whatsappSock.sendPresenceUpdate('paused', jid)
     botRespondiendo.add(jid)
     await whatsappSock.sendMessage(jid, { text: mensajeLimpio })
     botRespondiendo.delete(jid)
@@ -288,11 +327,12 @@ async function procesarMensaje(message, enTiempoReal = true) {
       const numVentas = process.env.NUMERO_VENTAS
       if (numVentas) {
         const info = contactosInfo[jid] || {}
+        const telefonoNotif = telefonoReal || info.telefono || jid.replace('@lid', '').replace('@s.whatsapp.net', '')
         const notif = [
           '🔔 *CLIENTE LISTO PARA COTIZAR*',
           info.nombre ? `Nombre: ${info.nombre}` : '',
           info.empresa ? `Empresa: ${info.empresa}` : '',
-          `WhatsApp: wa.me/${telefono}`,
+          telefonoNotif ? `WhatsApp: wa.me/${telefonoNotif}` : '',
           `Mensaje: "${texto}"`
         ].filter(Boolean).join('\n')
         await whatsappSock.sendMessage(numVentas + '@s.whatsapp.net', { text: notif })
@@ -348,15 +388,17 @@ async function conectarWhatsApp() {
     }
     if (connection === 'close') {
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode
-      if (code !== DisconnectReason.loggedOut) {
-        console.log('Reconectando...')
-        conectarWhatsApp()
-      } else {
-        console.log('Sesión cerrada. Borra ./session y reinicia para escanear el QR de nuevo.')
+      if (code !== DisconnectReason.loggedOut && !reconectando) {
+        reconectando = true
+        console.log('Reconectando en 5 segundos...')
+        setTimeout(() => { reconectando = false; conectarWhatsApp() }, 5000)
+      } else if (code === DisconnectReason.loggedOut) {
+        console.log('Sesión cerrada. Reiniciá el servidor para escanear el QR de nuevo.')
         botListo = false
         io.emit('bot_desconectado')
       }
     } else if (connection === 'open') {
+      reconectando = false
       console.log('\n==============================')
       console.log('  BOT DE BOTH COMPANY ACTIVO')
       console.log('==============================\n')
@@ -366,15 +408,17 @@ async function conectarWhatsApp() {
     }
   })
 
-  whatsappSock.ev.on('messages.upsert', async ({ messages, type }) => {
+  whatsappSock.ev.on('messages.upsert', ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return
     for (const message of messages) {
       if (!message.message) continue
-      try {
-        await procesarMensaje(message, type === 'notify')
-      } catch (e) {
-        console.error('Error procesando mensaje:', e.message)
-      }
+      const jid = message.key.remoteJid
+      if (!jid) continue
+      const esNotify = type === 'notify'
+      const anterior = colasPorJid[jid] || Promise.resolve()
+      colasPorJid[jid] = anterior
+        .then(() => procesarMensaje(message, esNotify))
+        .catch(e => console.error('Error procesando mensaje:', e.message))
     }
   })
 }
