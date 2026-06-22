@@ -150,7 +150,7 @@ P: ¿Trabajan con cualquier tipo de prenda?
 R: Sí, bordamos en camisas, polos, gorras, chaquetas, mochilas, delantales y más. El cliente puede traer su prenda o nosotros conseguirla.
 
 P: ¿Necesito tener el logo listo?
-R: Idealmente sí, en formato digital (JPG, PNG, PDF o AI). Si no lo tenés, podemos ayudarte a adaptarlo.
+R: Idealmente sí, en formato digital (JPG, PNG, PDF o AI). Si no lo tiene, con gusto le ayudamos a adaptarlo.
 
 P: ¿Hacen muestras antes del pedido completo?
 R: Sí, hacemos muestras. El costo es de $3.00 a $3.50 dependiendo del diseño.

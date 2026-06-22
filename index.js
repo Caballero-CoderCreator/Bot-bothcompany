@@ -70,11 +70,12 @@ RESTRICCIONES:
 ${empresa.restricciones}
 
 INSTRUCCIONES:
-- Respondé en español, de forma directa y sin frases de relleno
-- Máximo 3-4 líneas por respuesta
-- Si el cliente da suficiente info, dá una cotización estimada usando la tabla de precios
-- Si falta info para cotizar, preguntá lo necesario de forma natural
-- Si no sabés algo, decí que un asesor puede confirmar
+- Dirigite SIEMPRE al cliente de USTED (trato formal y profesional). Nunca uses "vos" ni "tú".
+- Tono de proveedor serio para empresas: profesional y cálido, sin jerga ni exceso de confianza.
+- Respondé en español, de forma directa y sin frases de relleno. Máximo 3-4 líneas por respuesta.
+- Si el cliente da suficiente info, prepará una cotización estimada usando la tabla de precios.
+- Si falta info para cotizar, solicitá lo necesario de forma natural y cortés.
+- Si no sabés algo, indicá que un asesor lo confirmará.
 
 Al final de CADA respuesta agregá exactamente una de estas etiquetas:
 - Si el cliente consulta información general → [ESTADO:CONSULTA]
@@ -117,6 +118,20 @@ async function guardarCliente(telefono, nombre, empresaNombre) {
   } catch (e) {
     console.error('Error Supabase:', e.message)
     return null
+  }
+}
+
+// ── Marca actividad del cliente para el follow-up ──
+// Actualiza ultimo_contacto_at (y opcionalmente el estado). NO resetea followup_at:
+// cada cliente recibe como máximo un follow-up histórico.
+async function marcarContacto(clienteId, estado) {
+  if (!clienteId) return
+  const patch = { ultimo_contacto_at: new Date().toISOString() }
+  if (estado) patch.estado_conv = estado
+  try {
+    await supabase.from('clientes').update(patch).eq('id', clienteId)
+  } catch (e) {
+    console.error('Error marcarContacto:', e.message)
   }
 }
 
@@ -163,6 +178,7 @@ io.on('connection', (socket) => {
 
   socket.on('tomar_control', (fromId) => {
     tomadoPorHumano[fromId] = true
+    marcarContacto(contactosInfo[fromId]?.clienteId, 'atendido')  // lo atiende un humano
     io.emit('estado_actualizado', { numero: fromId, tomado: true })
   })
 
@@ -213,6 +229,7 @@ async function procesarMensaje(message, enTiempoReal = true) {
     if (ultimoBot && ultimoBot.texto === texto) return  // es el eco del bot, no una respuesta humana
     if (!tomadoPorHumano[jid]) {
       tomadoPorHumano[jid] = true
+      marcarContacto(contactosInfo[jid]?.clienteId, 'atendido')  // el dueño respondió desde su teléfono
       io.emit('estado_actualizado', { numero: jid, tomado: true })
     }
     if (!conversaciones[jid]) conversaciones[jid] = []
@@ -249,6 +266,9 @@ async function procesarMensaje(message, enTiempoReal = true) {
   // Mensajes históricos (append al reconectar): solo mostrar en panel, nunca responder
   if (!enTiempoReal) return
 
+  // Registrar actividad del cliente (base del follow-up automático)
+  marcarContacto(clienteId)
+
   if (tomadoPorHumano[jid]) {
     io.emit('atencion_requerida', jid)
     return
@@ -280,7 +300,7 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
   try {
     const promptFinal = esNuevo
-      ? SYSTEM_PROMPT + '\n\nEs la primera vez que escribe este cliente. Respondé su consulta directamente y de forma natural preguntá su nombre y empresa en la misma respuesta. Sé breve y fluido.'
+      ? SYSTEM_PROMPT + '\n\nEs la primera vez que escribe este cliente. Respondé su consulta directamente y, de forma natural y cortés, pregúntele su nombre y el de su empresa en la misma respuesta. Sea breve y profesional, tratándolo siempre de usted.'
       : SYSTEM_PROMPT
 
     const historial = (conversaciones[jid] || [])
@@ -324,6 +344,7 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
     if (listoParaVenta) {
       io.emit('cliente_listo', jid)
+      marcarContacto(clienteId, 'listo')  // ya pasó a ventas: no recibe follow-up de consulta
       const numVentas = process.env.NUMERO_VENTAS
       if (numVentas) {
         const info = contactosInfo[jid] || {}
@@ -423,9 +444,75 @@ async function conectarWhatsApp() {
   })
 }
 
+// ── Follow-up automático ──
+// Recontacta una vez a clientes de WhatsApp que consultaron y se enfriaron (>24h sin
+// avanzar), nunca atendidos por humano ni pasados a venta. Lee de Supabase (no memoria),
+// así que sobrevive reinicios de Railway. Solo envía en horario diurno de El Salvador.
+const FOLLOWUP_HORAS = 24          // horas de inactividad antes de recontactar
+const FOLLOWUP_HORA_INICIO = 8     // no enviar antes de las 8am (hora SV)
+const FOLLOWUP_HORA_FIN = 20       // ni después de las 8pm
+const FOLLOWUP_MAX_POR_CICLO = 15  // tope de envíos por chequeo (anti-burst)
+
+const FOLLOWUP_MENSAJE = `Buen día{nombre}. Le saludamos de Both Company. Damos seguimiento a su consulta sobre bordados y uniformes corporativos. Con gusto preparamos una cotización a la medida de su empresa, sin compromiso. Quedamos atentos a sus comentarios.`
+
+// El Salvador es UTC-6 todo el año (sin horario de verano)
+function horaSV() {
+  return (new Date().getUTCHours() - 6 + 24) % 24
+}
+
+async function revisarFollowups() {
+  if (!botListo || !whatsappSock) return
+  const h = horaSV()
+  if (h < FOLLOWUP_HORA_INICIO || h >= FOLLOWUP_HORA_FIN) return
+
+  const corte = new Date(Date.now() - FOLLOWUP_HORAS * 3600 * 1000).toISOString()
+  try {
+    const { data, error } = await supabase
+      .from('clientes')
+      .select('id, nombre, telefono')
+      .eq('fuente', 'whatsapp')
+      .eq('estado_conv', 'consulta')
+      .is('followup_at', null)
+      .not('ultimo_contacto_at', 'is', null)
+      .lt('ultimo_contacto_at', corte)
+      .limit(FOLLOWUP_MAX_POR_CICLO)
+
+    if (error) { console.error('Follow-up query:', error.message); return }
+    if (!data || data.length === 0) return
+
+    for (const c of data) {
+      // solo teléfonos reales (no LIDs ni identificadores raros)
+      if (!c.telefono || !/^[0-9]{8,15}$/.test(c.telefono)) continue
+      const jid = c.telefono + '@s.whatsapp.net'
+      const nombre = (c.nombre && !/^[0-9]+$/.test(c.nombre)) ? ' ' + c.nombre.split(' ')[0] : ''
+      const msg = FOLLOWUP_MENSAJE.replace('{nombre}', nombre)
+      try {
+        botRespondiendo.add(jid)
+        await whatsappSock.sendMessage(jid, { text: msg })
+        botRespondiendo.delete(jid)
+        await supabase.from('clientes').update({ followup_at: new Date().toISOString() }).eq('id', c.id)
+
+        const hora = new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
+        const m = { de: 'bot', texto: msg, hora }
+        if (!conversaciones[jid]) conversaciones[jid] = []
+        conversaciones[jid].push(m)
+        io.emit('nuevo_mensaje', { numero: jid, mensaje: m })
+        console.log(`Follow-up enviado a ${c.telefono}`)
+
+        await new Promise(r => setTimeout(r, 5000))  // espaciar envíos
+      } catch (e) {
+        console.error(`Error follow-up a ${c.telefono}:`, e.message)
+      }
+    }
+  } catch (e) {
+    console.error('revisarFollowups:', e.message)
+  }
+}
+
 // ── Iniciar ──
 server.listen(PORT, () => {
   console.log(`Panel web en: http://localhost:${PORT}`)
 })
 
 conectarWhatsApp()
+setInterval(revisarFollowups, 30 * 60 * 1000)  // cada 30 min
