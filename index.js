@@ -41,7 +41,84 @@ let reconectando = false
 const app = express()
 const server = http.createServer(app)
 const io = new Server(server)
+app.use(express.json())
 app.use(express.static(path.join(__dirname, 'public')))
+
+// ── API de envío saliente (para n8n / Motor 2 captación en frío) ──
+// Protegida con API key. Permite que n8n dispare mensajes de WhatsApp a prospectos.
+// Body: { telefono, mensaje, nombre?, origen? }
+const SEND_API_KEY = process.env.SEND_API_KEY || ''
+
+// Normaliza un teléfono a JID de WhatsApp. El Salvador = 8 dígitos → prefijo 503.
+function aJid(telefono) {
+  let n = String(telefono || '').replace(/\D/g, '')
+  if (!n) return null
+  if (n.length === 8) n = '503' + n            // número SV sin código de país
+  if (n.length < 8 || n.length > 15) return null
+  return n + '@s.whatsapp.net'
+}
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, botListo, ts: new Date().toISOString() })
+})
+
+app.post('/api/enviar', async (req, res) => {
+  // Auth: fail-closed. Si no hay SEND_API_KEY configurada, no se permite envío externo.
+  if (!SEND_API_KEY || req.get('x-api-key') !== SEND_API_KEY) {
+    return res.status(401).json({ ok: false, error: 'no autorizado' })
+  }
+  if (!botListo || !whatsappSock) {
+    return res.status(503).json({ ok: false, error: 'bot no conectado' })
+  }
+
+  const { telefono, mensaje, nombre, origen } = req.body || {}
+  if (!mensaje || !String(mensaje).trim()) {
+    return res.status(400).json({ ok: false, error: 'falta mensaje' })
+  }
+  const jid = aJid(telefono)
+  if (!jid) return res.status(400).json({ ok: false, error: 'teléfono inválido' })
+
+  try {
+    // Guardar/asegurar el cliente en CRM como lead de prospección en frío
+    const telLimpio = jid.replace('@s.whatsapp.net', '')
+    let clienteId = null
+    try {
+      const { data: existente } = await supabase
+        .from('clientes').select('id').eq('telefono', telLimpio).maybeSingle()
+      if (existente) {
+        clienteId = existente.id
+      } else {
+        const { data: nuevo } = await supabase.from('clientes').insert({
+          nombre: nombre || telLimpio,
+          telefono: telLimpio,
+          fuente: origen || 'prospeccion-fria'
+        }).select('id').maybeSingle()
+        clienteId = nuevo?.id || null
+      }
+    } catch (e) { console.error('CRM lead (enviar):', e.message) }
+
+    botRespondiendo.add(jid)
+    await whatsappSock.sendMessage(jid, { text: String(mensaje) })
+    botRespondiendo.delete(jid)
+
+    // Reflejar en panel y memoria de conversación
+    const hora = new Date().toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })
+    const m = { de: 'bot', texto: String(mensaje), hora }
+    if (!conversaciones[jid]) conversaciones[jid] = []
+    conversaciones[jid].push(m)
+    io.emit('nuevo_mensaje', { numero: jid, mensaje: m })
+
+    // Marcar contacto para que el follow-up automático no pise la prospección en frío:
+    // se deja estado 'atendido' (la cadencia de seguimiento la maneja n8n, no el bot).
+    if (clienteId) await marcarContacto(clienteId, 'atendido')
+
+    console.log(`API /enviar → ${telLimpio} (${origen || 'prospeccion-fria'})`)
+    res.json({ ok: true, jid, clienteId })
+  } catch (e) {
+    console.error('Error /api/enviar:', e.message)
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
 
 // ── System prompt ──
 const SYSTEM_PROMPT = `Eres el asistente virtual de ${empresa.nombre}, ${empresa.descripcion}.
