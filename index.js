@@ -30,6 +30,7 @@ const tomadoPorHumano = {}
 const contactosInfo = {}
 const esperandoNombre = new Set()
 const botRespondiendo = new Set()
+const prospectoVerificado = new Set()  // jids ya chequeados contra Supabase (frío vs orgánico)
 let botListo = false
 let whatsappSock = null
 let ultimoQR = null
@@ -108,9 +109,11 @@ app.post('/api/enviar', async (req, res) => {
     conversaciones[jid].push(m)
     io.emit('nuevo_mensaje', { numero: jid, mensaje: m })
 
-    // Marcar contacto para que el follow-up automático no pise la prospección en frío:
-    // se deja estado 'atendido' (la cadencia de seguimiento la maneja n8n, no el bot).
-    if (clienteId) await marcarContacto(clienteId, 'atendido')
+    // Prospección en frío = trato empresa-empresa. El bot NO debe contestar cuando este
+    // contacto responda: lo atiende un humano. Se marca persistente (estado_conv='prospeccion',
+    // sobrevive reinicios de Railway) y en memoria (tomadoPorHumano) para efecto inmediato.
+    tomadoPorHumano[jid] = true
+    if (clienteId) await marcarContacto(clienteId, 'prospeccion')
 
     console.log(`API /enviar → ${telLimpio} (${origen || 'prospeccion-fria'})`)
     res.json({ ok: true, jid, clienteId })
@@ -345,6 +348,36 @@ async function procesarMensaje(message, enTiempoReal = true) {
 
   // Registrar actividad del cliente (base del follow-up automático)
   marcarContacto(clienteId)
+
+  // Prospección en frío: si NOSOTROS contactamos primero a este número (propuesta/mensaje en
+  // frío), es trato empresa-empresa → el bot calla y lo atiende un humano. La marca vive en
+  // Supabase (estado_conv='prospeccion' o fuente≠'whatsapp'), así sobrevive reinicios de Railway.
+  if (!tomadoPorHumano[jid] && !prospectoVerificado.has(jid)) {
+    prospectoVerificado.add(jid)
+    try {
+      const telLookup = telefonoReal || jid.replace('@lid', '').replace('@s.whatsapp.net', '')
+      const { data: cli } = await supabase
+        .from('clientes').select('fuente, estado_conv, nombre, empresa')
+        .eq('telefono', telLookup).maybeSingle()
+      if (cli && (cli.estado_conv === 'prospeccion' || (cli.fuente && cli.fuente !== 'whatsapp'))) {
+        tomadoPorHumano[jid] = true
+        // Avisar para atención humana (panel + WhatsApp de ventas)
+        const numVentas = process.env.NUMERO_VENTAS
+        if (numVentas) {
+          const notif = [
+            '🤝 *PROSPECTO EN FRÍO RESPONDIÓ* (el bot NO contestará)',
+            cli.nombre ? `Nombre: ${cli.nombre}` : '',
+            cli.empresa ? `Empresa: ${cli.empresa}` : '',
+            telLookup ? `WhatsApp: wa.me/${telLookup}` : '',
+            `Mensaje: "${texto}"`
+          ].filter(Boolean).join('\n')
+          try { await whatsappSock.sendMessage(numVentas + '@s.whatsapp.net', { text: notif }) }
+          catch (e) { console.error('Notif prospecto frío:', e.message) }
+        }
+        console.log(`Prospecto en frío respondió (${telLookup}) → bot en silencio, pasa a humano`)
+      }
+    } catch (e) { console.error('Chequeo prospecto frío:', e.message) }
+  }
 
   if (tomadoPorHumano[jid]) {
     io.emit('atencion_requerida', jid)
