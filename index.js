@@ -10,6 +10,7 @@ const http = require('http')
 const { Server } = require('socket.io')
 const path = require('path')
 const empresa = require('./config-empresa')
+const { crearVigilante } = require('./lib/vigilante-correo')
 
 // ── Clientes API ──
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
@@ -58,6 +59,56 @@ function aJid(telefono) {
   if (n.length < 8 || n.length > 15) return null
   return n + '@s.whatsapp.net'
 }
+
+// ── Avisos internos al dueño (respuestas de prospectos por correo) ──
+// El número va en la variable NUMERO_AVISOS de Railway, no en el código (repo público).
+const JID_AVISOS = aJid(process.env.NUMERO_AVISOS || '')
+const TEL_AVISOS = JID_AVISOS ? JID_AVISOS.replace('@s.whatsapp.net', '') : null
+
+async function enviarAviso(texto) {
+  if (!JID_AVISOS) throw new Error('falta NUMERO_AVISOS')
+  if (!botListo || !whatsappSock) throw new Error('bot no conectado')
+  botRespondiendo.add(JID_AVISOS)
+  try {
+    await whatsappSock.sendMessage(JID_AVISOS, { text: texto })
+  } finally {
+    botRespondiendo.delete(JID_AVISOS)
+  }
+}
+
+const vigilanteCorreo = process.env.GMAIL_APP_PASSWORD
+  ? crearVigilante({
+      supabase,
+      enviarAviso,
+      usuario: process.env.GMAIL_USER || 'juan@bothcompanysv.com',
+      password: process.env.GMAIL_APP_PASSWORD
+    })
+  : null
+
+async function revisarCorreo() {
+  if (!vigilanteCorreo || !JID_AVISOS || !botListo) return
+  try {
+    const r = await vigilanteCorreo.revisar()
+    if (r.avisados?.length) console.log(`Vigilante correo: ${r.avisados.length} aviso(s) enviados`)
+  } catch (e) {
+    console.error('Vigilante correo:', e.message)
+  }
+}
+
+// Forzar una revisión ahora (pruebas). ?probar=1 solo arma los avisos, sin enviarlos ni etiquetar.
+app.post('/api/vigilante-correo', async (req, res) => {
+  if (!SEND_API_KEY || req.get('x-api-key') !== SEND_API_KEY) {
+    return res.status(401).json({ ok: false, error: 'no autorizado' })
+  }
+  if (!vigilanteCorreo) return res.status(503).json({ ok: false, error: 'falta GMAIL_APP_PASSWORD' })
+  if (!JID_AVISOS) return res.status(503).json({ ok: false, error: 'falta NUMERO_AVISOS' })
+  try {
+    const r = await vigilanteCorreo.revisar({ soloProbar: req.query.probar === '1' })
+    res.json({ ok: true, ...r })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, botListo, ts: new Date().toISOString() })
@@ -287,6 +338,11 @@ io.on('connection', (socket) => {
 async function procesarMensaje(message, enTiempoReal = true) {
   const jid = message.key.remoteJid
   if (!jid || jid.includes('broadcast') || jid.endsWith('@g.us')) return
+  // El número de avisos es del dueño, no un cliente: el bot no le contesta ni lo guarda en el CRM
+  if (TEL_AVISOS) {
+    const alt = String(message.key.senderPn || message.key.remoteJidAlt || '').replace(/@.*/, '')
+    if (jid === JID_AVISOS || resolverTelefono(jid) === TEL_AVISOS || alt === TEL_AVISOS) return
+  }
 
   const textoRaw = message.message?.conversation
     || message.message?.extendedTextMessage?.text
@@ -626,3 +682,5 @@ server.listen(PORT, () => {
 
 conectarWhatsApp()
 setInterval(revisarFollowups, 30 * 60 * 1000)  // cada 30 min
+setInterval(revisarCorreo, 10 * 60 * 1000)     // respuestas de prospectos por correo → WhatsApp
+setTimeout(revisarCorreo, 90 * 1000)           // primera vuelta al arrancar, cuando el bot ya conectó
